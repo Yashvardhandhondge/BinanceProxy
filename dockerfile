@@ -10,4 +10,5 @@ COPY . .
 # Expose the port your app runs on
 EXPOSE 3000
 
+# Use environment variables
 CMD ["node", "index.js"]

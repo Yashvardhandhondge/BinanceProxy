@@ -37,6 +37,36 @@ jobs:
         
     - name: Add host to known_hosts
       run: ssh-keyscan -H ${{ secrets.AWS_HOST }} >> ~/.ssh/known_hosts
+    
+    - name: Create .env file
+      run: |
+        cat > .env.production << EOL
+        # Security
+        JWT_SECRET=yash
+
+        # Logging
+        LOG_LEVEL=info
+
+        # Rate limiting
+        RATE_LIMIT_WINDOW=60000
+        RATE_LIMIT_MAX_REQUESTS=100
+
+        # Optional whitelist for allowed frontend origins
+        ALLOWED_ORIGINS=https://ai-trading-three.vercel.app
+
+        # Server configuration
+        PORT=3000
+        NODE_ENV=production
+
+        # Security
+        API_SECRET=3205bd9c55cf46effe51835123d875a22b82f5e2ca85842500aed88d65692b20
+
+        # Timeouts
+        REQUEST_TIMEOUT=15000
+        EOL
+    
+    - name: Copy .env file to server
+      run: scp .env.production ${{ secrets.AWS_USERNAME }}@${{ secrets.AWS_HOST }}:~/binance-proxy.env
         
     - name: Deploy to AWS
       run: |
@@ -51,14 +81,21 @@ jobs:
           # Create logs directory if it doesn't exist
           mkdir -p ~/logs
           
-          # Run the new container
+          # Run the new container with environment variables
           docker run -d \
             --name binance-proxy \
             -p 3000:3000 \
             -v ~/logs:/app/logs \
+            --env-file ~/binance-proxy.env \
             --restart unless-stopped \
             ${{ secrets.DOCKERHUB_USERNAME }}/binance-proxy:latest
           
+          # Print container logs
+          echo "Container logs:"
+          sleep 5  # Wait for container to start
+          docker logs binance-proxy
+          
           # Check if container is running
+          echo "Container status:"
           docker ps | grep binance-proxy
         EOF
