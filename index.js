@@ -286,6 +286,169 @@ function calculateAssetValues(balances, priceMap) {
   };
 }
 
+// Function to fetch Funding wallet balance
+async function fetchFundingWallet(apiKey, apiSecret) {
+  try {
+    const timestamp = Date.now();
+    const queryString = `timestamp=${timestamp}`;
+    
+    const signature = crypto
+      .createHmac('sha256', apiSecret)
+      .update(queryString)
+      .digest('hex');
+    
+    const url = `https://api.binance.com/sapi/v1/asset/get-funding-asset?${queryString}&signature=${signature}`;
+    
+    const response = await axios({
+      method: 'POST',
+      url: url,
+      headers: {
+        'X-MBX-APIKEY': apiKey,
+        'User-Agent': 'Mozilla/5.0 ProxyServer/1.0',
+        'Accept': 'application/json'
+      },
+      timeout: 10000
+    });
+    
+    console.log(`Fetched funding wallet with ${response.data.length} assets`);
+    
+    // Transform to match standard balance format
+    return response.data.map(item => ({
+      asset: item.asset,
+      free: item.free,
+      locked: item.locked || '0',
+      freeze: item.freeze || '0',
+      withdrawing: item.withdrawing || '0',
+      btcValuation: item.btcValuation,
+      walletType: 'FUNDING'
+    }));
+  } catch (error) {
+    console.error('Error fetching funding wallet:', error.message);
+    return [];
+  }
+}
+
+// Function to fetch all wallet balances (Spot, Funding, etc.)
+async function fetchAllWalletBalances(credentials) {
+  try {
+    const results = {
+      SPOT: [],
+      FUNDING: [],
+      OTHER: [] // For any future wallet types
+    };
+    
+    // 1. Fetch Spot wallet (main account)
+    const timestamp = Date.now();
+    const queryString = `timestamp=${timestamp}`;
+    
+    const signature = crypto
+      .createHmac('sha256', credentials.secret)
+      .update(queryString)
+      .digest('hex');
+    
+    const spotUrl = `https://api.binance.com/api/v3/account?${queryString}&signature=${signature}`;
+    
+    const spotResponse = await axios({
+      method: 'GET',
+      url: spotUrl,
+      headers: {
+        'X-MBX-APIKEY': credentials.key,
+        'User-Agent': 'Mozilla/5.0 ProxyServer/1.0',
+        'Accept': 'application/json'
+      },
+      timeout: 10000
+    });
+    
+    // Get all non-zero balances from spot account
+    const nonZeroSpotBalances = spotResponse.data.balances
+      .filter(asset => parseFloat(asset.free) > 0 || parseFloat(asset.locked) > 0)
+      .map(asset => ({...asset, walletType: 'SPOT'}));
+    
+    results.SPOT = nonZeroSpotBalances;
+    
+    // 2. Fetch Funding wallet
+    const fundingBalances = await fetchFundingWallet(credentials.key, credentials.secret);
+    results.FUNDING = fundingBalances;
+    
+    // 3. Try to fetch cross-margin account (if needed)
+    try {
+      const marginTimestamp = Date.now();
+      const marginQueryString = `timestamp=${marginTimestamp}`;
+      
+      const marginSignature = crypto
+        .createHmac('sha256', credentials.secret)
+        .update(marginQueryString)
+        .digest('hex');
+      
+      const marginUrl = `https://api.binance.com/sapi/v1/margin/account?${marginQueryString}&signature=${marginSignature}`;
+      
+      const marginResponse = await axios({
+        method: 'GET',
+        url: marginUrl,
+        headers: {
+          'X-MBX-APIKEY': credentials.key,
+          'User-Agent': 'Mozilla/5.0 ProxyServer/1.0',
+          'Accept': 'application/json'
+        },
+        timeout: 10000
+      });
+      
+      // Process margin balances if needed
+      if (marginResponse.data.userAssets) {
+        const nonZeroMarginBalances = marginResponse.data.userAssets
+          .filter(asset => parseFloat(asset.free) > 0 || parseFloat(asset.locked) > 0)
+          .map(asset => ({...asset, walletType: 'MARGIN'}));
+        
+        results.OTHER = [...results.OTHER, ...nonZeroMarginBalances];
+        console.log(`Fetched margin account with ${nonZeroMarginBalances.length} assets`);
+      }
+    } catch (marginError) {
+      // Margin account might not be enabled, so we'll just log and continue
+      console.log('Note: Could not fetch margin account (possibly not enabled)');
+    }
+    
+    return results;
+  } catch (error) {
+    console.error('Error fetching wallets:', error.message);
+    throw error;
+  }
+}
+
+// Function to prepare combined wallet data with USDC values
+async function prepareWalletData(credentials) {
+  // Fetch all wallet balances
+  const wallets = await fetchAllWalletBalances(credentials);
+  
+  // Fetch current prices for conversion
+  console.log("Fetching current market prices for USDC conversion...");
+  const priceMap = await fetchAllPrices();
+  
+  // Process each wallet type
+  const processedWallets = {};
+  let totalUsdcValue = 0;
+  
+  for (const [walletType, balances] of Object.entries(wallets)) {
+    if (balances.length > 0) {
+      const walletValues = calculateAssetValues(balances, priceMap);
+      processedWallets[walletType] = walletValues;
+      totalUsdcValue += parseFloat(walletValues.totalUsdcValue);
+      
+      console.log(`===== ${walletType} WALLET (${walletValues.totalUsdcValue} USDC) =====`);
+      walletValues.assets.forEach(asset => {
+        console.log(
+          `${asset.asset}: ${asset.total} (≈ ${asset.usdcValue} USDC) [${asset.conversionPath}]`
+        );
+      });
+    }
+  }
+  
+  return {
+    timestamp: new Date().toISOString(),
+    totalUsdcValue: totalUsdcValue.toFixed(2),
+    wallets: processedWallets
+  };
+}
+
 // Main proxy endpoint for Binance API
 app.post('/api/proxy/binance', async (req, res) => {
   try {
@@ -417,7 +580,70 @@ app.post('/api/proxy/binance', async (req, res) => {
   }
 });
 
-// New endpoint to directly get account balance
+// New endpoint to directly get all wallet balances
+app.get('/api/user/:userId/all-balances', async (req, res) => {
+  try {
+    const { userId } = req.params;
+    
+    // Get API credentials for the user
+    const credentials = API_KEYS[userId];
+    if (!credentials) {
+      return res.status(404).json({ error: 'API key not found for user' });
+    }
+    
+    console.log(`Fetching all wallet balances for user ${userId}`);
+    
+    // Get comprehensive wallet data
+    const walletData = await prepareWalletData(credentials);
+    
+    // Log summary
+    console.log(`===== SUMMARY FOR USER ${userId} =====`);
+    console.log(`Total across all wallets: ${walletData.totalUsdcValue} USDC`);
+    for (const walletType of Object.keys(walletData.wallets)) {
+      console.log(`${walletType}: ${walletData.wallets[walletType].totalUsdcValue} USDC`);
+    }
+    
+    // Log to a separate balance log file
+    try {
+      const balanceLog = {
+        userId,
+        timestamp: walletData.timestamp,
+        totalUsdcValue: walletData.totalUsdcValue,
+        wallets: walletData.wallets
+      };
+      
+      fs.appendFileSync(
+        path.join(logsDir, 'all_wallets_logs.json'),
+        JSON.stringify(balanceLog) + '\n'
+      );
+    } catch (logError) {
+      console.error('Error writing to wallet log:', logError);
+    }
+    
+    // Return formatted balance information
+    return res.json({
+      success: true,
+      ...walletData
+    });
+  } catch (error) {
+    console.error('Balance fetch error:', error.message);
+    
+    if (axios.isAxiosError(error)) {
+      return res.status(error.response?.status || 500).json({
+        success: false,
+        error: error.response?.data || error.message
+      });
+    }
+    
+    return res.status(500).json({
+      success: false,
+      error: 'Internal server error',
+      message: error.message
+    });
+  }
+});
+
+// Update the existing balance endpoint to use the new comprehensive function
 app.get('/api/user/:userId/balance', async (req, res) => {
   try {
     const { userId } = req.params;
@@ -428,51 +654,17 @@ app.get('/api/user/:userId/balance', async (req, res) => {
       return res.status(404).json({ error: 'API key not found for user' });
     }
     
-    console.log(`Fetching balance for user ${userId}`);
+    console.log(`Fetching balance for user ${userId} (all wallets)`);
     
-    // Add timestamp for signature
-    const timestamp = Date.now();
-    const queryString = `timestamp=${timestamp}`;
-    
-    // Generate signature
-    const signature = crypto
-      .createHmac('sha256', credentials.secret)
-      .update(queryString)
-      .digest('hex');
-    
-    // Full URL with signature
-    const url = `https://api.binance.com/api/v3/account?${queryString}&signature=${signature}`;
-    
-    // Make the request to Binance
-    const response = await axios({
-      method: 'GET',
-      url,
-      headers: {
-        'X-MBX-APIKEY': credentials.key,
-        'User-Agent': 'Mozilla/5.0 ProxyServer/1.0',
-        'Accept': 'application/json'
-      },
-      timeout: 10000
-    });
-    
-    // Get all balances with non-zero amounts
-    const nonZeroBalances = response.data.balances.filter(
-      asset => parseFloat(asset.free) > 0 || parseFloat(asset.locked) > 0
-    );
-    
-    // Fetch current prices for conversion
-    const priceMap = await fetchAllPrices();
-    
-    // Calculate and log USDC values
-    const assetValues = calculateAssetValues(nonZeroBalances, priceMap);
+    // Get comprehensive wallet data
+    const walletData = await prepareWalletData(credentials);
     
     // Return formatted balance information
     return res.json({
       success: true,
-      timestamp: new Date().toISOString(),
-      totalUsdcValue: assetValues.totalUsdcValue,
-      assets: assetValues.assets,
-      rawBalances: nonZeroBalances
+      timestamp: walletData.timestamp,
+      totalUsdcValue: walletData.totalUsdcValue,
+      wallets: walletData.wallets
     });
   } catch (error) {
     console.error('Balance fetch error:', error.message);
