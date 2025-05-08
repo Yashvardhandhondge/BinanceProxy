@@ -14,7 +14,7 @@ dotenv.config();
 
 const app = express();
 const PORT = process.env.PORT || 3000;
-const API_SECRET = process.env.API_SECRET || 'your_default_secret_key';
+const API_SECRET = process.env.API_SECRET || 'yash';
 
 // Create logs directory if it doesn't exist
 const logsDir = path.join(__dirname, 'logs');
@@ -207,18 +207,11 @@ app.post('/api/proxy/binance', async (req, res) => {
   try {
     const { userId, endpoint, method = 'GET', params = {} } = req.body;
     
-    // Validate request
-    if (!userId || !endpoint) {
-      return res.status(400).json({ error: 'Missing required fields' });
-    }
-    
     // Get API credentials for the user
     const credentials = API_KEYS[userId];
     if (!credentials) {
       return res.status(404).json({ error: 'API key not found for user' });
     }
-    
-    console.log(`Processing request for user ${userId}: ${method} ${endpoint}`);
     
     // Add timestamp for signature
     const timestamp = Date.now();
@@ -241,7 +234,7 @@ app.post('/api/proxy/binance', async (req, res) => {
     // Full URL with signature
     const url = `https://api.binance.com${endpoint}?${queryString}&signature=${signature}`;
     
-    // Make the request
+    // Make the request to Binance
     const response = await axios({
       method,
       url,
@@ -250,27 +243,15 @@ app.post('/api/proxy/binance', async (req, res) => {
         'User-Agent': 'Mozilla/5.0 ProxyServer/1.0',
         'Accept': 'application/json'
       },
-      timeout: 10000,
-      validateStatus: () => true // Process any status code
+      timeout: 10000
     });
     
-    // Log successful requests
-    if (response.status >= 200 && response.status < 300) {
-      console.log(`Request successful: ${method} ${endpoint} - Status: ${response.status} ${response}`);
-    } else {
-      console.warn(`Request failed: ${method} ${endpoint} - Status: ${response.status} ${response}`);
-      if (response.data) {
-        console.warn('Error response:', JSON.stringify(response.data).substring(0, 200));
-      }
-    }
-    
-    // Return the response data and status
+    // Return the response data directly without modification
     return res.status(response.status).json({
       success: response.status >= 200 && response.status < 300,
       statusCode: response.status,
       data: response.data
     });
-    
   } catch (error) {
     console.error('Proxy error:', error.message);
     
