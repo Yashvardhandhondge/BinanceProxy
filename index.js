@@ -449,6 +449,54 @@ async function prepareWalletData(credentials) {
   };
 }
 
+// Function to convert wallet data to portfolio format compatible with the frontend app
+function convertToPortfolioFormat(walletData) {
+  // Extract totalValue from all wallets combined
+  const totalValue = parseFloat(walletData.totalUsdcValue);
+  
+  // Calculate holdings from assets across all wallets
+  const holdings = [];
+  let allocatedCapital = 0;
+  let freeCapital = 0;
+  
+  // Process each wallet
+  Object.entries(walletData.wallets).forEach(([walletType, walletInfo]) => {
+    walletInfo.assets.forEach(asset => {
+      // Consider stablecoins as free capital, others as holdings
+      const isStablecoin = ['USDT', 'USDC', 'BUSD', 'DAI', 'UST', 'TUSD', 'PAX', 'USDP'].includes(asset.asset);
+      
+      if (isStablecoin) {
+        // Add to free capital
+        freeCapital += parseFloat(asset.usdcValue);
+      } else {
+        // Add to holdings
+        holdings.push({
+          symbol: asset.asset,
+          quantity: asset.total,
+          value: parseFloat(asset.usdcValue),
+          price: parseFloat(asset.usdcValue) / asset.total,
+          walletType: asset.walletType || walletType,
+          updatedAt: new Date().toISOString()
+        });
+        allocatedCapital += parseFloat(asset.usdcValue);
+      }
+    });
+  });
+
+  // Sort holdings by value (descending)
+  holdings.sort((a, b) => b.value - a.value);
+  
+  return {
+    totalValue,
+    freeCapital,
+    allocatedCapital,
+    holdings,
+    realizedPnl: 0, // This would need historical data from Binance
+    unrealizedPnl: 0, // This would need position data from Binance
+    updatedAt: new Date().toISOString()
+  };
+}
+
 // Main proxy endpoint for Binance API
 app.post('/api/proxy/binance', async (req, res) => {
   try {
@@ -500,60 +548,46 @@ app.post('/api/proxy/binance', async (req, res) => {
     console.log(`Received ${response.status} response for ${endpoint} [Request ID: ${timestamp}]`);
     
     // Special handling for account endpoint to extract and log balances
-    if (endpoint === '/api/v3/account') {
+    if (endpoint === '/api/v3/account' || endpoint.includes('account') || endpoint.includes('balance')) {
       console.log(`===== ACCOUNT INFORMATION FOR USER ${userId} =====`);
-      console.log(`Account type: ${response.data.accountType}`);
-      console.log(`Can trade: ${response.data.canTrade}`);
-      console.log(`Can withdraw: ${response.data.canWithdraw}`);
-      console.log(`Can deposit: ${response.data.canDeposit}`);
       
-      // Get all balances with non-zero amounts
-      const nonZeroBalances = response.data.balances.filter(
-        asset => parseFloat(asset.free) > 0 || parseFloat(asset.locked) > 0
-      );
+      // Get wallet data across all accounts (spot, funding, etc.)
+      console.log("Fetching comprehensive wallet data from all accounts...");
+      const walletData = await prepareWalletData(credentials);
       
-      console.log(`Found ${nonZeroBalances.length} assets with non-zero balance`);
+      // Convert to portfolio format for frontend
+      const portfolioData = convertToPortfolioFormat(walletData);
       
-      // Fetch current prices for conversion
-      console.log("Fetching current market prices for USDC conversion...");
-      const priceMap = await fetchAllPrices();
+      console.log(`===== PORTFOLIO SUMMARY =====`);
+      console.log(`Total Value: ${portfolioData.totalValue} USDC`);
+      console.log(`Free Capital: ${portfolioData.freeCapital} USDC`);
+      console.log(`Allocated Capital: ${portfolioData.allocatedCapital} USDC`);
+      console.log(`Holdings: ${portfolioData.holdings.length} assets`);
       
-      // Calculate and log USDC values
-      const assetValues = calculateAssetValues(nonZeroBalances, priceMap);
+      // Add portfolio data to the response
+      response.data.portfolio = portfolioData;
       
-      console.log(`===== BALANCE SUMMARY (Total: ${assetValues.totalUsdcValue} USDC) =====`);
-      assetValues.assets.forEach(asset => {
-        console.log(
-          `${asset.asset}: ${asset.total} (≈ ${asset.usdcValue} USDC) [${asset.conversionPath}]`
-        );
-      });
+      // Add the original wallet data for reference
+      response.data.walletData = walletData;
       
-      // Add the calculated values to the response
-      response.data.calculatedBalances = {
-        timestamp: new Date().toISOString(),
-        totalUsdcValue: assetValues.totalUsdcValue,
-        assets: assetValues.assets
-      };
-      
-      // Log to a separate balance log file
+      // Log to a separate portfolio log file
       try {
-        const balanceLog = {
+        const portfolioLog = {
           userId,
           timestamp: new Date().toISOString(),
-          totalUsdcValue: assetValues.totalUsdcValue,
-          assets: assetValues.assets
+          ...portfolioData
         };
         
         fs.appendFileSync(
-          path.join(logsDir, 'balance_logs.json'),
-          JSON.stringify(balanceLog) + '\n'
+          path.join(logsDir, 'portfolio_logs.json'),
+          JSON.stringify(portfolioLog) + '\n'
         );
       } catch (logError) {
-        console.error('Error writing to balance log:', logError);
+        console.error('Error writing to portfolio log:', logError);
       }
     }
     
-    // Return the response data directly without modification
+    // Return the response data including portfolio information if available
     return res.status(response.status).json({
       success: response.status >= 200 && response.status < 300,
       statusCode: response.status,
@@ -580,8 +614,8 @@ app.post('/api/proxy/binance', async (req, res) => {
   }
 });
 
-// New endpoint to directly get all wallet balances
-app.get('/api/user/:userId/all-balances', async (req, res) => {
+// Create a dedicated portfolio endpoint that's compatible with the NextJS backend
+app.get('/api/user/:userId/portfolio', async (req, res) => {
   try {
     const { userId } = req.params;
     
@@ -591,83 +625,33 @@ app.get('/api/user/:userId/all-balances', async (req, res) => {
       return res.status(404).json({ error: 'API key not found for user' });
     }
     
-    console.log(`Fetching all wallet balances for user ${userId}`);
+    console.log(`Fetching portfolio for user ${userId}`);
     
     // Get comprehensive wallet data
     const walletData = await prepareWalletData(credentials);
+    
+    // Convert to portfolio format
+    const portfolioData = convertToPortfolioFormat(walletData);
     
     // Log summary
-    console.log(`===== SUMMARY FOR USER ${userId} =====`);
-    console.log(`Total across all wallets: ${walletData.totalUsdcValue} USDC`);
-    for (const walletType of Object.keys(walletData.wallets)) {
-      console.log(`${walletType}: ${walletData.wallets[walletType].totalUsdcValue} USDC`);
-    }
+    console.log(`===== PORTFOLIO SUMMARY FOR USER ${userId} =====`);
+    console.log(`Total Value: ${portfolioData.totalValue} USDC`);
+    console.log(`Free Capital: ${portfolioData.freeCapital} USDC`);
+    console.log(`Allocated Capital: ${portfolioData.allocatedCapital} USDC`);
     
-    // Log to a separate balance log file
-    try {
-      const balanceLog = {
-        userId,
-        timestamp: walletData.timestamp,
-        totalUsdcValue: walletData.totalUsdcValue,
-        wallets: walletData.wallets
-      };
-      
-      fs.appendFileSync(
-        path.join(logsDir, 'all_wallets_logs.json'),
-        JSON.stringify(balanceLog) + '\n'
-      );
-    } catch (logError) {
-      console.error('Error writing to wallet log:', logError);
-    }
-    
-    // Return formatted balance information
+    // Return formatted portfolio information matching the expected model
     return res.json({
-      success: true,
-      ...walletData
+      userId,
+      totalValue: portfolioData.totalValue,
+      freeCapital: portfolioData.freeCapital,
+      allocatedCapital: portfolioData.allocatedCapital,
+      realizedPnl: portfolioData.realizedPnl,
+      unrealizedPnl: portfolioData.unrealizedPnl,
+      holdings: portfolioData.holdings,
+      updatedAt: portfolioData.updatedAt
     });
   } catch (error) {
-    console.error('Balance fetch error:', error.message);
-    
-    if (axios.isAxiosError(error)) {
-      return res.status(error.response?.status || 500).json({
-        success: false,
-        error: error.response?.data || error.message
-      });
-    }
-    
-    return res.status(500).json({
-      success: false,
-      error: 'Internal server error',
-      message: error.message
-    });
-  }
-});
-
-// Update the existing balance endpoint to use the new comprehensive function
-app.get('/api/user/:userId/balance', async (req, res) => {
-  try {
-    const { userId } = req.params;
-    
-    // Get API credentials for the user
-    const credentials = API_KEYS[userId];
-    if (!credentials) {
-      return res.status(404).json({ error: 'API key not found for user' });
-    }
-    
-    console.log(`Fetching balance for user ${userId} (all wallets)`);
-    
-    // Get comprehensive wallet data
-    const walletData = await prepareWalletData(credentials);
-    
-    // Return formatted balance information
-    return res.json({
-      success: true,
-      timestamp: walletData.timestamp,
-      totalUsdcValue: walletData.totalUsdcValue,
-      wallets: walletData.wallets
-    });
-  } catch (error) {
-    console.error('Balance fetch error:', error.message);
+    console.error('Portfolio fetch error:', error.message);
     
     if (axios.isAxiosError(error)) {
       return res.status(error.response?.status || 500).json({
