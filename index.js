@@ -202,6 +202,90 @@ app.delete('/api/user/:userId/key', (req, res) => {
   return res.json({ success: true });
 });
 
+// Function to fetch all symbol prices for USDC conversion
+async function fetchAllPrices() {
+  try {
+    const response = await axios({
+      method: 'GET',
+      url: 'https://api.binance.com/api/v3/ticker/price',
+      headers: {
+        'User-Agent': 'Mozilla/5.0 ProxyServer/1.0',
+        'Accept': 'application/json'
+      }
+    });
+    
+    // Create a price map for quick lookups
+    const priceMap = {};
+    response.data.forEach(item => {
+      priceMap[item.symbol] = parseFloat(item.price);
+    });
+    
+    console.log(`Fetched prices for ${Object.keys(priceMap).length} symbols`);
+    return priceMap;
+  } catch (error) {
+    console.error('Error fetching prices:', error.message);
+    return {};
+  }
+}
+
+// Function to calculate USDC value of assets
+function calculateAssetValues(balances, priceMap) {
+  const result = [];
+  let totalUsdcValue = 0;
+  
+  balances.forEach(asset => {
+    const free = parseFloat(asset.free);
+    const locked = parseFloat(asset.locked);
+    const total = free + locked;
+    
+    // Skip assets with zero balance
+    if (total <= 0) return;
+    
+    // Try different pairs to get USDC value
+    let usdcValue = 0;
+    let conversionPath = '';
+    
+    if (asset.asset === 'USDC') {
+      usdcValue = total;
+      conversionPath = 'Direct';
+    } else if (priceMap[`${asset.asset}USDC`]) {
+      usdcValue = total * priceMap[`${asset.asset}USDC`];
+      conversionPath = `${asset.asset}USDC`;
+    } else if (priceMap[`USDC${asset.asset}`]) {
+      usdcValue = total / priceMap[`USDC${asset.asset}`];
+      conversionPath = `USDC${asset.asset} (inverse)`;
+    } else if (priceMap[`${asset.asset}USDT`]) {
+      // Assume 1 USDT ≈ 1 USDC for approximate valuation
+      usdcValue = total * priceMap[`${asset.asset}USDT`];
+      conversionPath = `${asset.asset}USDT (as proxy)`;
+    } else if (priceMap[`${asset.asset}BTC`] && priceMap['BTCUSDC']) {
+      usdcValue = total * priceMap[`${asset.asset}BTC`] * priceMap['BTCUSDC'];
+      conversionPath = `${asset.asset}BTC → BTCUSDC`;
+    } else {
+      conversionPath = 'No conversion path';
+    }
+    
+    totalUsdcValue += usdcValue;
+    
+    result.push({
+      asset: asset.asset,
+      free,
+      locked,
+      total,
+      usdcValue: usdcValue.toFixed(2),
+      conversionPath
+    });
+  });
+  
+  // Sort by USDC value (descending)
+  result.sort((a, b) => parseFloat(b.usdcValue) - parseFloat(a.usdcValue));
+  
+  return {
+    assets: result,
+    totalUsdcValue: totalUsdcValue.toFixed(2)
+  };
+}
+
 // Main proxy endpoint for Binance API
 app.post('/api/proxy/binance', async (req, res) => {
   try {
@@ -212,6 +296,8 @@ app.post('/api/proxy/binance', async (req, res) => {
     if (!credentials) {
       return res.status(404).json({ error: 'API key not found for user' });
     }
+    
+    console.log(`Processing ${method} request to ${endpoint} for user ${userId}`);
     
     // Add timestamp for signature
     const timestamp = Date.now();
@@ -234,6 +320,8 @@ app.post('/api/proxy/binance', async (req, res) => {
     // Full URL with signature
     const url = `https://api.binance.com${endpoint}?${queryString}&signature=${signature}`;
     
+    console.log(`Making request to: ${endpoint} [Request ID: ${timestamp}]`);
+    
     // Make the request to Binance
     const response = await axios({
       method,
@@ -245,6 +333,62 @@ app.post('/api/proxy/binance', async (req, res) => {
       },
       timeout: 10000
     });
+    
+    console.log(`Received ${response.status} response for ${endpoint} [Request ID: ${timestamp}]`);
+    
+    // Special handling for account endpoint to extract and log balances
+    if (endpoint === '/api/v3/account') {
+      console.log(`===== ACCOUNT INFORMATION FOR USER ${userId} =====`);
+      console.log(`Account type: ${response.data.accountType}`);
+      console.log(`Can trade: ${response.data.canTrade}`);
+      console.log(`Can withdraw: ${response.data.canWithdraw}`);
+      console.log(`Can deposit: ${response.data.canDeposit}`);
+      
+      // Get all balances with non-zero amounts
+      const nonZeroBalances = response.data.balances.filter(
+        asset => parseFloat(asset.free) > 0 || parseFloat(asset.locked) > 0
+      );
+      
+      console.log(`Found ${nonZeroBalances.length} assets with non-zero balance`);
+      
+      // Fetch current prices for conversion
+      console.log("Fetching current market prices for USDC conversion...");
+      const priceMap = await fetchAllPrices();
+      
+      // Calculate and log USDC values
+      const assetValues = calculateAssetValues(nonZeroBalances, priceMap);
+      
+      console.log(`===== BALANCE SUMMARY (Total: ${assetValues.totalUsdcValue} USDC) =====`);
+      assetValues.assets.forEach(asset => {
+        console.log(
+          `${asset.asset}: ${asset.total} (≈ ${asset.usdcValue} USDC) [${asset.conversionPath}]`
+        );
+      });
+      
+      // Add the calculated values to the response
+      response.data.calculatedBalances = {
+        timestamp: new Date().toISOString(),
+        totalUsdcValue: assetValues.totalUsdcValue,
+        assets: assetValues.assets
+      };
+      
+      // Log to a separate balance log file
+      try {
+        const balanceLog = {
+          userId,
+          timestamp: new Date().toISOString(),
+          totalUsdcValue: assetValues.totalUsdcValue,
+          assets: assetValues.assets
+        };
+        
+        fs.appendFileSync(
+          path.join(logsDir, 'balance_logs.json'),
+          JSON.stringify(balanceLog) + '\n'
+        );
+      } catch (logError) {
+        console.error('Error writing to balance log:', logError);
+      }
+    }
     
     // Return the response data directly without modification
     return res.status(response.status).json({
@@ -262,6 +406,81 @@ app.post('/api/proxy/binance', async (req, res) => {
         statusCode: error.response?.status || 500,
         error: error.response?.data || error.message,
         message: 'API request failed'
+      });
+    }
+    
+    return res.status(500).json({
+      success: false,
+      error: 'Internal server error',
+      message: error.message
+    });
+  }
+});
+
+// New endpoint to directly get account balance
+app.get('/api/user/:userId/balance', async (req, res) => {
+  try {
+    const { userId } = req.params;
+    
+    // Get API credentials for the user
+    const credentials = API_KEYS[userId];
+    if (!credentials) {
+      return res.status(404).json({ error: 'API key not found for user' });
+    }
+    
+    console.log(`Fetching balance for user ${userId}`);
+    
+    // Add timestamp for signature
+    const timestamp = Date.now();
+    const queryString = `timestamp=${timestamp}`;
+    
+    // Generate signature
+    const signature = crypto
+      .createHmac('sha256', credentials.secret)
+      .update(queryString)
+      .digest('hex');
+    
+    // Full URL with signature
+    const url = `https://api.binance.com/api/v3/account?${queryString}&signature=${signature}`;
+    
+    // Make the request to Binance
+    const response = await axios({
+      method: 'GET',
+      url,
+      headers: {
+        'X-MBX-APIKEY': credentials.key,
+        'User-Agent': 'Mozilla/5.0 ProxyServer/1.0',
+        'Accept': 'application/json'
+      },
+      timeout: 10000
+    });
+    
+    // Get all balances with non-zero amounts
+    const nonZeroBalances = response.data.balances.filter(
+      asset => parseFloat(asset.free) > 0 || parseFloat(asset.locked) > 0
+    );
+    
+    // Fetch current prices for conversion
+    const priceMap = await fetchAllPrices();
+    
+    // Calculate and log USDC values
+    const assetValues = calculateAssetValues(nonZeroBalances, priceMap);
+    
+    // Return formatted balance information
+    return res.json({
+      success: true,
+      timestamp: new Date().toISOString(),
+      totalUsdcValue: assetValues.totalUsdcValue,
+      assets: assetValues.assets,
+      rawBalances: nonZeroBalances
+    });
+  } catch (error) {
+    console.error('Balance fetch error:', error.message);
+    
+    if (axios.isAxiosError(error)) {
+      return res.status(error.response?.status || 500).json({
+        success: false,
+        error: error.response?.data || error.message
       });
     }
     
