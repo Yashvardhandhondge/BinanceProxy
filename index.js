@@ -668,6 +668,113 @@ app.get('/api/user/:userId/portfolio', async (req, res) => {
   }
 });
 
+// Function to log trades to file
+function logTrades(userId, trades) {
+  try {
+    const tradeLog = {
+      userId,
+      timestamp: new Date().toISOString(),
+      trades: trades
+    };
+
+    fs.appendFileSync(
+      path.join(logsDir, 'trade_logs.json'),
+      JSON.stringify(tradeLog) + '\n'
+    );
+  } catch (error) {
+    console.error('Error writing to trade log:', error);
+  }
+}
+
+// Get user trades endpoint
+app.get('/api/user/:userId/trades', async (req, res) => {
+  try {
+    const { userId } = req.params;
+    const { symbol, limit = 50, startTime, endTime } = req.query;
+    
+    const credentials = API_KEYS[userId];
+    if (!credentials) {
+      return res.status(404).json({ error: 'API key not found for user' });
+    }
+    
+    const timestamp = Date.now();
+    const params = {
+      timestamp,
+      limit: Math.min(parseInt(limit), 1000)
+    };
+    
+    if (symbol) params.symbol = symbol;
+    if (startTime) params.startTime = startTime;
+    if (endTime) params.endTime = endTime;
+    
+    const queryString = Object.entries(params)
+      .map(([key, value]) => `${key}=${encodeURIComponent(String(value))}`)
+      .join('&');
+    
+    const signature = crypto
+      .createHmac('sha256', credentials.secret)
+      .update(queryString)
+      .digest('hex');
+    
+    const url = `https://api.binance.com/api/v3/myTrades?${queryString}&signature=${signature}`;
+    
+    console.log(`Fetching trades for user ${userId}${symbol ? ` and symbol ${symbol}` : ''}`);
+    
+    const response = await axios({
+      method: 'GET',
+      url,
+      headers: {
+        'X-MBX-APIKEY': credentials.key,
+        'User-Agent': 'Mozilla/5.0 ProxyServer/1.0',
+        'Accept': 'application/json'
+      },
+      timeout: 10000
+    });
+    
+    const trades = response.data.map(trade => ({
+      id: trade.id,
+      symbol: trade.symbol,
+      price: parseFloat(trade.price),
+      quantity: parseFloat(trade.qty),
+      quoteQuantity: parseFloat(trade.quoteQty),
+      commission: parseFloat(trade.commission),
+      commissionAsset: trade.commissionAsset,
+      time: new Date(trade.time).toISOString(),
+      isBuyer: trade.isBuyer,
+      isMaker: trade.isMaker,
+      tradeType: trade.isBuyer ? 'BUY' : 'SELL',
+      total: (parseFloat(trade.price) * parseFloat(trade.qty)).toFixed(8)
+    }));
+
+    // Log trades to file
+    logTrades(userId, trades);
+    
+    console.log(`Found ${trades.length} trades for user ${userId}`);
+    
+    return res.status(200).json({
+      success: true,
+      count: trades.length,
+      trades: trades
+    });
+    
+  } catch (error) {
+    console.error('Error fetching trades:', error);
+    
+    if (axios.isAxiosError(error)) {
+      return res.status(error.response?.status || 500).json({
+        success: false,
+        error: error.response?.data || error.message
+      });
+    }
+    
+    return res.status(500).json({
+      success: false,
+      error: 'Internal server error',
+      message: error.message
+    });
+  }
+});
+
 // Health check endpoint
 app.get('/health', (req, res) => {
   res.json({ 
