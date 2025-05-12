@@ -462,19 +462,18 @@ function convertToPortfolioFormat(walletData) {
   // Process each wallet
   Object.entries(walletData.wallets).forEach(([walletType, walletInfo]) => {
     walletInfo.assets.forEach(asset => {
-      // Consider stablecoins as free capital, others as holdings
       const isStablecoin = ['USDT', 'USDC', 'BUSD', 'DAI', 'UST', 'TUSD', 'PAX', 'USDP'].includes(asset.asset);
       
       if (isStablecoin) {
         // Add to free capital
         freeCapital += parseFloat(asset.usdcValue);
       } else {
-        // Add to holdings
+        // updated keys to match frontend
         holdings.push({
-          symbol: asset.asset,
-          quantity: asset.total,
+          token: asset.asset,
+          amount: asset.total,
+          currentPrice: parseFloat(asset.usdcValue) / asset.total,
           value: parseFloat(asset.usdcValue),
-          price: parseFloat(asset.usdcValue) / asset.total,
           walletType: asset.walletType || walletType,
           updatedAt: new Date().toISOString()
         });
