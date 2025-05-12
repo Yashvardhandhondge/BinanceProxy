@@ -668,21 +668,50 @@ app.get('/api/user/:userId/portfolio', async (req, res) => {
   }
 });
 
-// Function to log trades to file
-function logTrades(userId, trades) {
+// Enhanced trade logging function
+function logTradesSummary(userId, trades) {
   try {
+    // Calculate trade summary
+    const summary = trades.reduce((acc, trade) => {
+      acc.totalVolume += parseFloat(trade.quoteQuantity);
+      acc.totalCommission += parseFloat(trade.commission);
+      acc[trade.tradeType] = (acc[trade.tradeType] || 0) + 1;
+      return acc;
+    }, { totalVolume: 0, totalCommission: 0 });
+
     const tradeLog = {
       userId,
       timestamp: new Date().toISOString(),
-      trades: trades
+      summary: {
+        totalTrades: trades.length,
+        buyCount: summary.BUY || 0,
+        sellCount: summary.SELL || 0,
+        totalVolume: summary.totalVolume.toFixed(2),
+        totalCommission: summary.totalCommission.toFixed(8)
+      },
+      trades: trades.map(t => ({
+        symbol: t.symbol,
+        type: t.tradeType,
+        price: parseFloat(t.price),
+        quantity: parseFloat(t.quantity),
+        total: parseFloat(t.total),
+        time: t.time
+      }))
     };
 
+    // Log to file
     fs.appendFileSync(
       path.join(logsDir, 'trade_logs.json'),
       JSON.stringify(tradeLog) + '\n'
     );
+
+    // Console summary
+    console.log(`===== TRADE SUMMARY FOR USER ${userId} =====`);
+    console.log(`Total Trades: ${tradeLog.summary.totalTrades}`);
+    console.log(`Buy/Sell: ${tradeLog.summary.buyCount}/${tradeLog.summary.sellCount}`);
+    console.log(`Volume: ${tradeLog.summary.totalVolume} USDT`);
   } catch (error) {
-    console.error('Error writing to trade log:', error);
+    console.error('Error writing trade log:', error);
   }
 }
 
@@ -747,7 +776,7 @@ app.get('/api/user/:userId/trades', async (req, res) => {
     }));
 
     // Log trades to file
-    logTrades(userId, trades);
+    logTradesSummary(userId, trades);
     
     console.log(`Found ${trades.length} trades for user ${userId}`);
     
