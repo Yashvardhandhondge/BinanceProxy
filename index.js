@@ -470,6 +470,62 @@ app.get('/api/user/:userId/portfolio/simple', async (req, res) => {
   }
 });
 
+// index.js - Add recent trades endpoint
+app.get('/api/user/:userId/trades/recent', async (req, res) => {
+  try {
+    const { userId } = req.params;
+    const { limit = 50 } = req.query;
+    
+    const credentials = API_KEYS[userId];
+    if (!credentials) {
+      return res.status(404).json({ error: 'API key not found for user' });
+    }
+    
+    // Get recent trades
+    const timestamp = Date.now();
+    const queryString = `timestamp=${timestamp}&limit=${limit}`;
+    const signature = crypto
+      .createHmac('sha256', credentials.secret)
+      .update(queryString)
+      .digest('hex');
+    
+    const url = `https://api.binance.com/api/v3/myTrades?${queryString}&signature=${signature}`;
+    
+    const response = await axios({
+      method: 'GET',
+      url,
+      headers: {
+        'X-MBX-APIKEY': credentials.key,
+        'User-Agent': 'Mozilla/5.0 ProxyServer/1.0',
+        'Accept': 'application/json'
+      },
+      timeout: 10000
+    });
+    
+    // Format trades for the frontend
+    const trades = response.data.map(trade => ({
+      id: trade.id,
+      symbol: trade.symbol,
+      token: trade.symbol.replace(/USDT|BUSD|USDC/, ''),
+      price: parseFloat(trade.price),
+      quantity: parseFloat(trade.qty),
+      side: trade.isBuyer ? 'BUY' : 'SELL',
+      time: new Date(trade.time).toISOString(),
+      commission: parseFloat(trade.commission),
+      commissionAsset: trade.commissionAsset,
+      value: parseFloat(trade.quoteQty)
+    }));
+    
+    return res.json({
+      trades,
+      count: trades.length
+    });
+  } catch (error) {
+    console.error('Error fetching trades:', error.message);
+    return res.status(500).json({ error: 'Failed to fetch trades' });
+  }
+});
+
 // Get registered API keys (limited info, no secrets)
 app.get('/api/user/:userId/key-status', (req, res) => {
   const { userId } = req.params;
