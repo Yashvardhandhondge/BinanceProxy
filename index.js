@@ -333,6 +333,143 @@ app.get('/api/user/:userId/portfolio/optimized', async (req, res) => {
   }
 });
 
+// index.js - Add a simple portfolio endpoint
+app.get('/api/user/:userId/portfolio/simple', async (req, res) => {
+  try {
+    const { userId } = req.params;
+    
+    const credentials = API_KEYS[userId];
+    if (!credentials) {
+      return res.status(404).json({ error: 'API key not found for user' });
+    }
+    
+    console.log(`Fetching simple portfolio for user ${userId}`);
+    
+    // 1. Get account balances only
+    const timestamp = Date.now();
+    const queryString = `timestamp=${timestamp}`;
+    const signature = crypto
+      .createHmac('sha256', credentials.secret)
+      .update(queryString)
+      .digest('hex');
+    
+    const accountUrl = `https://api.binance.com/api/v3/account?${queryString}&signature=${signature}`;
+    
+    const accountResponse = await axios({
+      method: 'GET',
+      url: accountUrl,
+      headers: {
+        'X-MBX-APIKEY': credentials.key,
+        'User-Agent': 'Mozilla/5.0 ProxyServer/1.0',
+        'Accept': 'application/json'
+      },
+      timeout: 10000
+    });
+    
+    // 2. Filter only non-zero balances
+    const nonZeroBalances = accountResponse.data.balances
+      .filter(b => parseFloat(b.free) > 0 || parseFloat(b.locked) > 0)
+      .map(b => ({
+        asset: b.asset,
+        free: parseFloat(b.free),
+        locked: parseFloat(b.locked),
+        total: parseFloat(b.free) + parseFloat(b.locked)
+      }));
+    
+    console.log(`Found ${nonZeroBalances.length} non-zero balances`);
+    
+    // 3. Get prices only for tokens we have (not all)
+    const pricePromises = [];
+    const stablecoins = ['USDT', 'USDC', 'BUSD', 'DAI'];
+    
+    for (const balance of nonZeroBalances) {
+      if (stablecoins.includes(balance.asset)) {
+        // Stablecoins are 1:1 with USD
+        balance.price = 1;
+        balance.usdValue = balance.total;
+      } else {
+        // Get price for this specific token
+        pricePromises.push(
+          axios({
+            method: 'GET',
+            url: `https://api.binance.com/api/v3/ticker/price?symbol=${balance.asset}USDT`,
+            timeout: 5000
+          }).then(response => {
+            balance.price = parseFloat(response.data.price);
+            balance.usdValue = balance.total * balance.price;
+          }).catch(() => {
+            // If USDT pair doesn't exist, try BUSD
+            return axios({
+              method: 'GET',
+              url: `https://api.binance.com/api/v3/ticker/price?symbol=${balance.asset}BUSD`,
+              timeout: 5000
+            }).then(response => {
+              balance.price = parseFloat(response.data.price);
+              balance.usdValue = balance.total * balance.price;
+            });
+          }).catch(() => {
+            // If still no price, set to 0
+            balance.price = 0;
+            balance.usdValue = 0;
+          })
+        );
+      }
+    }
+    
+    // Wait for all price fetches
+    await Promise.all(pricePromises);
+    
+    // 4. Calculate totals
+    let totalValue = 0;
+    let freeCapital = 0;
+    let allocatedCapital = 0;
+    const holdings = [];
+    
+    for (const balance of nonZeroBalances) {
+      if (balance.usdValue > 0) {
+        totalValue += balance.usdValue;
+        
+        if (stablecoins.includes(balance.asset)) {
+          freeCapital += balance.usdValue;
+        } else {
+          allocatedCapital += balance.usdValue;
+          holdings.push({
+            token: balance.asset,
+            amount: balance.total,
+            currentPrice: balance.price,
+            value: balance.usdValue,
+            free: balance.free,
+            locked: balance.locked
+          });
+        }
+      }
+    }
+    
+    // Sort holdings by value
+    holdings.sort((a, b) => b.value - a.value);
+    
+    const portfolioData = {
+      userId,
+      totalValue,
+      freeCapital,
+      allocatedCapital,
+      holdings,
+      nonZeroBalances: nonZeroBalances.length,
+      timestamp: new Date().toISOString()
+    };
+    
+    console.log(`Portfolio: $${totalValue.toFixed(2)} total, ${holdings.length} holdings`);
+    
+    return res.json(portfolioData);
+  } catch (error) {
+    console.error('Error fetching simple portfolio:', error.message);
+    return res.status(500).json({
+      error: 'Failed to fetch portfolio',
+      details: error.message
+    });
+  }
+});
+
 // Get registered API keys (limited info, no secrets)
 app.get('/api/user/:userId/key-status', (req, res) => {
   const { userId } = req.params;
