@@ -526,87 +526,152 @@ app.get('/api/user/:userId/trades/recent', async (req, res) => {
   }
 });
 
-// index.js - Add this trades endpoint
+// index.js - Update the trades endpoint to handle the symbol requirement
 app.post('/api/trades', async (req, res) => {
   try {
-    const { userId, limit = 100 } = req.body;
+    const { userId, limit = 500, symbol } = req.body;
     
-    // Get API credentials for the user
+    console.log(`[TRADES] Request for user ${userId}, limit: ${limit}, symbol: ${symbol || 'not specified'}`);
+    
     const credentials = API_KEYS[userId];
     if (!credentials) {
+      console.log(`[TRADES] No API key found for user ${userId}`);
       return res.status(404).json({ error: 'API key not found for user' });
     }
     
-    console.log(`Fetching trades for user ${userId} with limit ${limit}`);
-    
-    // Create timestamp and query string
-    const timestamp = Date.now();
-    const queryString = `timestamp=${timestamp}&limit=${limit}`;
-    
-    // Generate signature
-    const signature = crypto
-      .createHmac('sha256', credentials.secret)
-      .update(queryString)
-      .digest('hex');
-    
-    // URL with signature
-    const url = `https://api.binance.com/api/v3/myTrades?${queryString}&signature=${signature}`;
-    
-    console.log(`Making request to Binance for trades...`);
-    
-    // Make request to Binance
-    const response = await axios({
-      method: 'GET',
-      url: url,
-      headers: {
-        'X-MBX-APIKEY': credentials.key,
-        'User-Agent': 'Mozilla/5.0 ProxyServer/1.0',
-        'Accept': 'application/json'
-      },
-      timeout: 10000
-    });
-    
-    console.log(`Received ${response.data.length} trades from Binance`);
-    
-    // Transform trades to consistent format
-    const trades = response.data.map((trade) => ({
-      id: trade.id,
-      symbol: trade.symbol,
-      token: trade.symbol.replace(/USDT$|BUSD$|USDC$/, ''),
-      type: trade.isBuyer ? 'BUY' : 'SELL',
-      price: parseFloat(trade.price),
-      amount: parseFloat(trade.qty),
-      time: new Date(trade.time).toISOString(),
-      commission: parseFloat(trade.commission),
-      commissionAsset: trade.commissionAsset,
-      total: (parseFloat(trade.price) * parseFloat(trade.qty)).toFixed(8),
-      isMaker: trade.isMaker
-    }));
-    
-    return res.json({
-      success: true,
-      trades: trades
-    });
-  } catch (error) {
-    console.error('Error fetching trades:', error.message);
-    
-    if (axios.isAxiosError(error)) {
-      const status = error.response?.status;
-      const data = error.response?.data;
+    // If no symbol specified, we need to get trades for all traded symbols
+    if (!symbol) {
+      // First, get account information to see what assets the user has traded
+      const timestamp = Date.now();
+      const accountQueryString = `timestamp=${timestamp}`;
+      const accountSignature = crypto
+        .createHmac('sha256', credentials.secret)
+        .update(accountQueryString)
+        .digest('hex');
       
-      // Handle specific Binance API errors
-      if (status === 401) {
-        return res.status(401).json({ 
-          success: false,
-          error: 'Invalid API key or signature',
-          details: data?.msg
-        });
-      } else if (data?.msg) {
-        return res.status(status || 400).json({ 
-          success: false,
-          error: data.msg 
-        });
+      const accountUrl = `https://api.binance.com/api/v3/account?${accountQueryString}&signature=${accountSignature}`;
+      
+      console.log(`[TRADES] Getting account info to find traded symbols...`);
+      
+      const accountResponse = await axios({
+        method: 'GET',
+        url: accountUrl,
+        headers: {
+          'X-MBX-APIKEY': credentials.key,
+          'User-Agent': 'Mozilla/5.0 ProxyServer/1.0',
+          'Accept': 'application/json'
+        },
+        timeout: 10000
+      });
+      
+      // Get all non-zero balances to determine which symbols have been traded
+      const tradedAssets = accountResponse.data.balances
+        .filter(b => parseFloat(b.free) > 0 || parseFloat(b.locked) > 0)
+        .map(b => b.asset)
+        .filter(asset => !['USDT', 'USDC', 'BUSD'].includes(asset)); // Exclude stablecoins
+      
+      console.log(`[TRADES] Found ${tradedAssets.length} traded assets`);
+      
+      // Fetch trades for each symbol
+      const allTrades = [];
+      const symbols = tradedAssets.map(asset => `${asset}USDT`); // Assuming USDT pairs
+      
+      // Add some common trading pairs if no assets found
+      if (symbols.length === 0) {
+        symbols.push('BTCUSDT', 'ETHUSDT', 'BNBUSDT');
       }
+      
+      for (const sym of symbols) {
+        try {
+          const timestamp = Date.now();
+          const queryString = `symbol=${sym}&timestamp=${timestamp}&limit=${Math.min(limit, 100)}`;
+          
+          const signature = crypto
+            .createHmac('sha256', credentials.secret)
+            .update(queryString)
+            .digest('hex');
+          
+          const url = `https://api.binance.com/api/v3/myTrades?${queryString}&signature=${signature}`;
+          
+          console.log(`[TRADES] Fetching trades for symbol: ${sym}`);
+          
+          const response = await axios({
+            method: 'GET',
+            url: url,
+            headers: {
+              'X-MBX-APIKEY': credentials.key,
+              'User-Agent': 'Mozilla/5.0 ProxyServer/1.0',
+              'Accept': 'application/json'
+            },
+            timeout: 10000
+          });
+          
+          if (response.data.length > 0) {
+            allTrades.push(...response.data);
+            console.log(`[TRADES] Found ${response.data.length} trades for ${sym}`);
+          }
+        } catch (symbolError) {
+          // If a specific symbol fails, continue with others
+          console.log(`[TRADES] No trades found for ${sym} or error occurred`);
+        }
+      }
+      
+      // Sort all trades by time (newest first)
+      allTrades.sort((a, b) => b.time - a.time);
+      
+      // Limit to requested number
+      const limitedTrades = allTrades.slice(0, limit);
+      
+      console.log(`[TRADES] Total trades found: ${allTrades.length}, returning: ${limitedTrades.length}`);
+      
+      return res.json({
+        success: true,
+        trades: limitedTrades
+      });
+    } else {
+      // If symbol is specified, fetch trades for that symbol only
+      const timestamp = Date.now();
+      const queryString = `symbol=${symbol}&timestamp=${timestamp}&limit=${limit}`;
+      
+      const signature = crypto
+        .createHmac('sha256', credentials.secret)
+        .update(queryString)
+        .digest('hex');
+      
+      const url = `https://api.binance.com/api/v3/myTrades?${queryString}&signature=${signature}`;
+      
+      console.log(`[TRADES] Fetching trades for specific symbol: ${symbol}`);
+      
+      const response = await axios({
+        method: 'GET',
+        url: url,
+        headers: {
+          'X-MBX-APIKEY': credentials.key,
+          'User-Agent': 'Mozilla/5.0 ProxyServer/1.0',
+          'Accept': 'application/json'
+        },
+        timeout: 10000
+      });
+      
+      console.log(`[TRADES] Found ${response.data.length} trades for ${symbol}`);
+      
+      return res.json({
+        success: true,
+        trades: response.data
+      });
+    }
+  } catch (error) {
+    console.error('[TRADES] Error:', error.message);
+    if (error.response) {
+      console.error('[TRADES] Binance error response:', error.response.data);
+    }
+    
+    if (axios.isAxiosError(error) && error.response) {
+      return res.status(error.response.status).json({
+        success: false,
+        error: error.response.data.msg || error.message,
+        code: error.response.data.code
+      });
     }
     
     return res.status(500).json({
@@ -616,7 +681,6 @@ app.post('/api/trades', async (req, res) => {
     });
   }
 });
-
 // Get registered API keys (limited info, no secrets)
 app.get('/api/user/:userId/key-status', (req, res) => {
   const { userId } = req.params;
