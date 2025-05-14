@@ -526,6 +526,97 @@ app.get('/api/user/:userId/trades/recent', async (req, res) => {
   }
 });
 
+// index.js - Add this trades endpoint
+app.post('/api/trades', async (req, res) => {
+  try {
+    const { userId, limit = 100 } = req.body;
+    
+    // Get API credentials for the user
+    const credentials = API_KEYS[userId];
+    if (!credentials) {
+      return res.status(404).json({ error: 'API key not found for user' });
+    }
+    
+    console.log(`Fetching trades for user ${userId} with limit ${limit}`);
+    
+    // Create timestamp and query string
+    const timestamp = Date.now();
+    const queryString = `timestamp=${timestamp}&limit=${limit}`;
+    
+    // Generate signature
+    const signature = crypto
+      .createHmac('sha256', credentials.secret)
+      .update(queryString)
+      .digest('hex');
+    
+    // URL with signature
+    const url = `https://api.binance.com/api/v3/myTrades?${queryString}&signature=${signature}`;
+    
+    console.log(`Making request to Binance for trades...`);
+    
+    // Make request to Binance
+    const response = await axios({
+      method: 'GET',
+      url: url,
+      headers: {
+        'X-MBX-APIKEY': credentials.key,
+        'User-Agent': 'Mozilla/5.0 ProxyServer/1.0',
+        'Accept': 'application/json'
+      },
+      timeout: 10000
+    });
+    
+    console.log(`Received ${response.data.length} trades from Binance`);
+    
+    // Transform trades to consistent format
+    const trades = response.data.map((trade) => ({
+      id: trade.id,
+      symbol: trade.symbol,
+      token: trade.symbol.replace(/USDT$|BUSD$|USDC$/, ''),
+      type: trade.isBuyer ? 'BUY' : 'SELL',
+      price: parseFloat(trade.price),
+      amount: parseFloat(trade.qty),
+      time: new Date(trade.time).toISOString(),
+      commission: parseFloat(trade.commission),
+      commissionAsset: trade.commissionAsset,
+      total: (parseFloat(trade.price) * parseFloat(trade.qty)).toFixed(8),
+      isMaker: trade.isMaker
+    }));
+    
+    return res.json({
+      success: true,
+      trades: trades
+    });
+  } catch (error) {
+    console.error('Error fetching trades:', error.message);
+    
+    if (axios.isAxiosError(error)) {
+      const status = error.response?.status;
+      const data = error.response?.data;
+      
+      // Handle specific Binance API errors
+      if (status === 401) {
+        return res.status(401).json({ 
+          success: false,
+          error: 'Invalid API key or signature',
+          details: data?.msg
+        });
+      } else if (data?.msg) {
+        return res.status(status || 400).json({ 
+          success: false,
+          error: data.msg 
+        });
+      }
+    }
+    
+    return res.status(500).json({
+      success: false,
+      error: 'Failed to fetch trades',
+      message: error.message
+    });
+  }
+});
+
 // Get registered API keys (limited info, no secrets)
 app.get('/api/user/:userId/key-status', (req, res) => {
   const { userId } = req.params;
