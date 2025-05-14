@@ -161,6 +161,178 @@ app.post('/api/register-key', async (req, res) => {
   }
 });
 
+
+// index.js - Add a new endpoint for batch price fetching
+app.get('/api/user/:userId/prices/batch', async (req, res) => {
+  try {
+    const { userId } = req.params;
+    
+    const credentials = API_KEYS[userId];
+    if (!credentials) {
+      return res.status(404).json({ error: 'API key not found for user' });
+    }
+    
+    console.log(`Fetching all prices for user ${userId}`);
+    
+    // Get all prices from Binance in a single request
+    const response = await axios({
+      method: 'GET',
+      url: 'https://api.binance.com/api/v3/ticker/price',
+      headers: {
+        'User-Agent': 'Mozilla/5.0 ProxyServer/1.0',
+        'Accept': 'application/json'
+      },
+      timeout: 10000
+    });
+    
+    // Convert to a map for easy lookup
+    const priceMap = {};
+    response.data.forEach(ticker => {
+      priceMap[ticker.symbol] = parseFloat(ticker.price);
+    });
+    
+    return res.json({
+      success: true,
+      prices: priceMap,
+      count: Object.keys(priceMap).length
+    });
+  } catch (error) {
+    console.error('Error fetching batch prices:', error.message);
+    return res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
+// Also add a more efficient portfolio endpoint
+app.get('/api/user/:userId/portfolio/optimized', async (req, res) => {
+  try {
+    const { userId } = req.params;
+    
+    const credentials = API_KEYS[userId];
+    if (!credentials) {
+      return res.status(404).json({ error: 'API key not found for user' });
+    }
+    
+    console.log(`Fetching optimized portfolio for user ${userId}`);
+    
+    // 1. Get account balances
+    const timestamp = Date.now();
+    const queryString = `timestamp=${timestamp}`;
+    const signature = crypto
+      .createHmac('sha256', credentials.secret)
+      .update(queryString)
+      .digest('hex');
+    
+    const accountUrl = `https://api.binance.com/api/v3/account?${queryString}&signature=${signature}`;
+    
+    const [accountResponse, pricesResponse] = await Promise.all([
+      // Get account data
+      axios({
+        method: 'GET',
+        url: accountUrl,
+        headers: {
+          'X-MBX-APIKEY': credentials.key,
+          'User-Agent': 'Mozilla/5.0 ProxyServer/1.0',
+          'Accept': 'application/json'
+        },
+        timeout: 10000
+      }),
+      // Get all prices in one request
+      axios({
+        method: 'GET',
+        url: 'https://api.binance.com/api/v3/ticker/price',
+        headers: {
+          'User-Agent': 'Mozilla/5.0 ProxyServer/1.0',
+          'Accept': 'application/json'
+        },
+        timeout: 10000
+      })
+    ]);
+    
+    // Create price map
+    const priceMap = {};
+    pricesResponse.data.forEach(ticker => {
+      priceMap[ticker.symbol] = parseFloat(ticker.price);
+    });
+    
+    // Process balances
+    const balances = accountResponse.data.balances
+      .filter(b => parseFloat(b.free) > 0 || parseFloat(b.locked) > 0);
+    
+    let totalValue = 0;
+    let freeCapital = 0;
+    let allocatedCapital = 0;
+    const holdings = [];
+    
+    const stablecoins = ['USDT', 'USDC', 'BUSD', 'DAI'];
+    
+    for (const balance of balances) {
+      const free = parseFloat(balance.free);
+      const locked = parseFloat(balance.locked);
+      const total = free + locked;
+      
+      let value = 0;
+      let currentPrice = 0;
+      
+      if (stablecoins.includes(balance.asset)) {
+        value = total;
+        currentPrice = 1;
+        freeCapital += value;
+      } else {
+        // Try different trading pairs
+        const pairs = [
+          `${balance.asset}USDT`,
+          `${balance.asset}BUSD`,
+          `${balance.asset}USDC`
+        ];
+        
+        for (const pair of pairs) {
+          if (priceMap[pair]) {
+            currentPrice = priceMap[pair];
+            value = total * currentPrice;
+            break;
+          }
+        }
+        
+        if (value > 0) {
+          holdings.push({
+            token: balance.asset,
+            amount: total,
+            currentPrice,
+            value,
+            free,
+            locked
+          });
+          allocatedCapital += value;
+        }
+      }
+      
+      totalValue += value;
+    }
+    
+    const portfolioData = {
+      userId,
+      totalValue,
+      freeCapital,
+      allocatedCapital,
+      holdings: holdings.sort((a, b) => b.value - a.value),
+      realizedPnl: 0, // Would need trade history
+      unrealizedPnl: 0, // Would need entry prices
+      timestamp: new Date().toISOString()
+    };
+    
+    return res.json(portfolioData);
+  } catch (error) {
+    console.error('Error fetching optimized portfolio:', error.message);
+    return res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
 // Get registered API keys (limited info, no secrets)
 app.get('/api/user/:userId/key-status', (req, res) => {
   const { userId } = req.params;
